@@ -1,6 +1,6 @@
 [package]
 name = "tokio-postgres"
-version = "0.7.11"
+version = "0.7.18"
 authors = ["Steven Fackler <sfackler@gmail.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
@@ -54,8 +54,8 @@ parking_lot = "0.12"
 percent-encoding = "2.0"
 pin-project-lite = "0.2"
 phf = "0.11"
-postgres-protocol = { version = "0.6.7", path = "../postgres-protocol" }
-postgres-types = { version = "0.2.7", path = "../postgres-types" }
+postgres-protocol = { version = "0.6.12", path = "../postgres-protocol" }
+postgres-types = { version = "0.2.14", path = "../postgres-types" }
 serde = { version = "1.0", optional = true }
 tokio = { version = "1.27", features = ["io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
