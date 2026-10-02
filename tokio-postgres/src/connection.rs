@@ -31,6 +31,17 @@ pub struct Request {
 
 pub struct Response {
     sender: mpsc::Sender<BackendMessages>,
+    /// Frames read off the wire that `sender` was not ready to accept, in wire
+    /// order, each with whether it completes the request.
+    parked: VecDeque<(BackendMessages, bool)>,
+}
+
+impl Response {
+    /// Whether this response's last frame has been read off the wire, so the
+    /// next frame belongs to a later request.
+    fn wire_complete(&self) -> bool {
+        self.parked.back().is_some_and(|(_, complete)| *complete)
+    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -101,6 +112,12 @@ where
         }
 
         loop {
+            self.flush_parked(cx);
+            if self.must_wait_on_consumer() {
+                trace!("poll_read: waiting on sender");
+                return Ok(None);
+            }
+
             let message = match self.poll_response(cx)? {
                 Poll::Ready(Some(message)) => message,
                 Poll::Ready(None) => return Err(Error::closed()),
@@ -137,37 +154,85 @@ where
                 } => (messages, request_complete),
             };
 
-            let mut response = match self.responses.pop_front() {
-                Some(response) => response,
+            let idx = match self.responses.iter().position(|r| !r.wire_complete()) {
+                Some(idx) => idx,
                 None => match messages.next().map_err(Error::parse)? {
                     Some(Message::ErrorResponse(error)) => return Err(Error::db(error)),
                     _ => return Err(Error::unexpected_message()),
                 },
             };
+            let response = &mut self.responses[idx];
+
+            if !response.parked.is_empty() {
+                response.parked.push_back((messages, request_complete));
+                continue;
+            }
 
             match response.sender.poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     let _ = response.sender.start_send(messages);
-                    if !request_complete {
-                        self.responses.push_front(response);
+                    if request_complete {
+                        self.responses.remove(idx);
                     }
                 }
                 Poll::Ready(Err(_)) => {
                     // we need to keep paging through the rest of the messages even if the receiver's hung up
-                    if !request_complete {
-                        self.responses.push_front(response);
+                    if request_complete {
+                        self.responses.remove(idx);
                     }
                 }
                 Poll::Pending => {
-                    self.responses.push_front(response);
-                    self.pending_responses.push_back(BackendMessage::Normal {
-                        messages,
-                        request_complete,
-                    });
-                    trace!("poll_read: waiting on sender");
-                    return Ok(None);
+                    trace!("poll_read: parking frame, sender not ready");
+                    response.parked.push_back((messages, request_complete));
                 }
             }
+        }
+    }
+
+    /// Delivers parked frames to every consumer that is ready for them, each
+    /// response independently so that one stalled consumer does not hold back
+    /// the others.
+    fn flush_parked(&mut self, cx: &mut Context<'_>) {
+        let mut idx = 0;
+        while idx < self.responses.len() {
+            let response = &mut self.responses[idx];
+            let mut delivered_complete = false;
+            while !response.parked.is_empty() {
+                match response.sender.poll_ready(cx) {
+                    Poll::Ready(result) => {
+                        let (messages, complete) = response.parked.pop_front().unwrap();
+                        if result.is_ok() {
+                            let _ = response.sender.start_send(messages);
+                        }
+                        if complete {
+                            delivered_complete = true;
+                            break;
+                        }
+                    }
+                    Poll::Pending => break,
+                }
+            }
+            if delivered_complete {
+                self.responses.remove(idx);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// Whether reading the wire has to wait for a stalled consumer.
+    ///
+    /// A stalled consumer normally pushes back on the server by leaving the
+    /// socket unread. That deadlocks when a later request is in flight: its
+    /// reply is queued behind this one's on the same socket, and the consumer
+    /// may be waiting on that reply before it reads again, which is what
+    /// `query_typed` does when it looks up an unknown column type while the
+    /// rows are already streaming. Frames are parked instead while any later
+    /// request is in flight, so its reply can be read and delivered.
+    fn must_wait_on_consumer(&self) -> bool {
+        match self.responses.iter().position(|r| !r.wire_complete()) {
+            Some(idx) => !self.responses[idx].parked.is_empty() && idx + 1 == self.responses.len(),
+            None => false,
         }
     }
 
@@ -186,6 +251,7 @@ where
                 trace!("polled new request");
                 self.responses.push_back(Response {
                     sender: request.sender,
+                    parked: VecDeque::new(),
                 });
                 Poll::Ready(Some(request.messages))
             }
@@ -323,7 +389,13 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<AsyncMessage, Error>>> {
         let message = self.poll_read(cx)?;
+        let in_flight = self.responses.len();
         let want_flush = self.poll_write(cx)?;
+        if message.is_none() && self.responses.len() > in_flight {
+            // A new request can lift `must_wait_on_consumer`, and nothing else
+            // would wake the read side to notice.
+            cx.waker().wake_by_ref();
+        }
         if want_flush {
             self.poll_flush(cx)?;
         }

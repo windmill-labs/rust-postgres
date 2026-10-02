@@ -1009,6 +1009,43 @@ async fn query_typed_no_transaction() {
     assert_eq!(updated_rows.len(), 0);
 }
 
+// `query_typed` looks up an unknown column type while the server is already
+// streaming rows; a result larger than the response channel used to leave
+// that lookup queued behind rows nobody read.
+#[tokio::test]
+async fn query_typed_large_result_with_unknown_type() {
+    let setup = connect("user=postgres").await;
+    setup
+        .batch_execute(
+            "DROP TYPE IF EXISTS query_typed_large_mood;
+             CREATE TYPE query_typed_large_mood AS ENUM ('ok');",
+        )
+        .await
+        .unwrap();
+
+    let client = connect("user=postgres").await;
+    let rows = time::timeout(
+        Duration::from_secs(60),
+        client.query_typed(
+            "SELECT 'ok'::query_typed_large_mood, repeat('x', 500) FROM generate_series(1, 100000)",
+            &[],
+        ),
+    )
+    .await
+    .expect("query_typed deadlocked")
+    .unwrap();
+    assert_eq!(rows.len(), 100000);
+    assert_eq!(
+        rows[0].columns()[0].type_().name(),
+        "query_typed_large_mood"
+    );
+
+    setup
+        .batch_execute("DROP TYPE query_typed_large_mood")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn query_typed_with_transaction() {
     let mut client = connect("user=postgres").await;
