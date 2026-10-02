@@ -99,7 +99,7 @@ where
     .await?;
 
     let mut stream = StartupStream {
-        inner: Framed::new(stream, PostgresCodec),
+        inner: Framed::new(stream, PostgresCodec::default()),
         buf: BackendMessages::empty(),
         delayed: VecDeque::new(),
     };
@@ -120,6 +120,7 @@ where
         config.ssl_negotiation,
         process_id,
         secret_key,
+        stream.inner.codec().transaction_status.clone(),
     );
     let connection = Connection::new(stream.inner, stream.delayed, parameters, receiver);
 

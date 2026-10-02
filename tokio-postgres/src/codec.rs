@@ -3,6 +3,8 @@ use fallible_iterator::FallibleIterator;
 use postgres_protocol::message::backend;
 use postgres_protocol::message::frontend::CopyData;
 use std::io;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use tokio_util::codec::{Decoder, Encoder};
 
 pub enum FrontendMessage {
@@ -35,7 +37,11 @@ impl FallibleIterator for BackendMessages {
     }
 }
 
-pub struct PostgresCodec;
+#[derive(Default)]
+pub struct PostgresCodec {
+    /// Status byte of the most recent ReadyForQuery, shared with the `Client`.
+    pub(crate) transaction_status: Arc<AtomicU8>,
+}
 
 impl Encoder<FrontendMessage> for PostgresCodec {
     type Error = io::Error;
@@ -81,6 +87,9 @@ impl Decoder for PostgresCodec {
             idx += len;
 
             if header.tag() == backend::READY_FOR_QUERY_TAG {
+                // The status is the message's single body byte, its last.
+                self.transaction_status
+                    .store(src[idx - 1], Ordering::Release);
                 request_complete = true;
                 break;
             }

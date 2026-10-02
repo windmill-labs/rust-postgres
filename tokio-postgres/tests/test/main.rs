@@ -67,6 +67,40 @@ async fn connect(s: &str) -> Client {
     client
 }
 
+#[tokio::test]
+async fn transaction_status_follows_ready_for_query() {
+    use tokio_postgres::TransactionStatus;
+
+    let client = connect("user=postgres").await;
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+    client.query("SELECT 1", &[]).await.unwrap();
+    assert_eq!(
+        client.transaction_status(),
+        TransactionStatus::InTransaction
+    );
+
+    client.query("SELECT 1/0", &[]).await.unwrap_err();
+    // An error can be returned before its ReadyForQuery is read; an empty
+    // query succeeds even in a failed transaction and completes the read.
+    client.batch_execute("").await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Failed);
+
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+
+    client
+        .batch_execute("BEGIN; SELECT 1; COMMIT")
+        .await
+        .unwrap();
+    assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+}
+
 async fn current_transaction_id(client: &Client) -> i64 {
     client
         .query("SELECT txid_current()", &[])

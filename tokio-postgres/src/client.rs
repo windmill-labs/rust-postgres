@@ -35,6 +35,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 #[cfg(feature = "runtime")]
@@ -109,6 +110,8 @@ pub struct InnerClient {
 
     /// A buffer to use when writing out postgres commands.
     buffer: Mutex<BytesMut>,
+
+    transaction_status: Arc<AtomicU8>,
 }
 
 impl InnerClient {
@@ -233,6 +236,17 @@ pub struct Client {
     secret_key: i32,
 }
 
+/// The server's transaction status, from its ReadyForQuery message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStatus {
+    /// Not in a transaction block.
+    Idle,
+    /// In a transaction block.
+    InTransaction,
+    /// In a failed transaction block; queries are rejected until it ends.
+    Failed,
+}
+
 impl Client {
     pub(crate) fn new(
         sender: mpsc::UnboundedSender<Request>,
@@ -240,12 +254,14 @@ impl Client {
         ssl_negotiation: SslNegotiation,
         process_id: i32,
         secret_key: i32,
+        transaction_status: Arc<AtomicU8>,
     ) -> Client {
         Client {
             inner: Arc::new(InnerClient {
                 sender,
                 cached_typeinfo: Default::default(),
                 buffer: Default::default(),
+                transaction_status,
             }),
             #[cfg(feature = "runtime")]
             socket_config: None,
@@ -710,6 +726,21 @@ impl Client {
     /// In that case, all future queries will fail.
     pub fn is_closed(&self) -> bool {
         self.inner.sender.is_closed()
+    }
+
+    /// The transaction status the server reported at the end of the most
+    /// recent completed request, without a round trip.
+    ///
+    /// While a request is still in flight this reflects the one before it. A
+    /// failed request can return its error before the server's status arrives,
+    /// so after an error the status is current only once a later request
+    /// completes; after a fully read result it is always current.
+    pub fn transaction_status(&self) -> TransactionStatus {
+        match self.inner.transaction_status.load(Ordering::Acquire) {
+            b'T' => TransactionStatus::InTransaction,
+            b'E' => TransactionStatus::Failed,
+            _ => TransactionStatus::Idle,
+        }
     }
 
     #[doc(hidden)]
