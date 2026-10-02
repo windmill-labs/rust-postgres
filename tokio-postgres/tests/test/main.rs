@@ -1009,6 +1009,51 @@ async fn query_typed_no_transaction() {
     assert_eq!(updated_rows.len(), 0);
 }
 
+// Without the description, `query_typed` looks the enum up while the rows
+// stream, and a result larger than the response channel leaves that lookup
+// queued behind rows nobody reads.
+#[tokio::test]
+async fn describe_typed_then_query_typed_large_result_with_unknown_type() {
+    let setup = connect("user=postgres").await;
+    setup
+        .batch_execute(
+            "DROP TYPE IF EXISTS describe_typed_mood;
+             CREATE TYPE describe_typed_mood AS ENUM ('ok');",
+        )
+        .await
+        .unwrap();
+
+    let client = connect("user=postgres").await;
+    let query =
+        "SELECT 'ok'::describe_typed_mood, repeat('x', 500) FROM generate_series(1, $1::int)";
+    let described = client.describe_typed(query, &[Type::INT4]).await.unwrap();
+    assert_eq!(described.columns()[0].type_().name(), "describe_typed_mood");
+
+    let rows = time::timeout(
+        Duration::from_secs(60),
+        client.query_typed(query, &[(&100000i32, Type::INT4)]),
+    )
+    .await
+    .expect("query_typed deadlocked")
+    .unwrap();
+    assert_eq!(rows.len(), 100000);
+
+    let prepared: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_prepared_statements WHERE statement = $1",
+            &[&query],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(prepared, 0, "describe_typed left a named statement behind");
+
+    setup
+        .batch_execute("DROP TYPE describe_typed_mood")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn query_typed_with_transaction() {
     let mut client = connect("user=postgres").await;

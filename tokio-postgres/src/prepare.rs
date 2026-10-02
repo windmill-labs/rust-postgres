@@ -64,6 +64,25 @@ pub async fn prepare(
     types: &[Type],
 ) -> Result<Statement, Error> {
     let name = format!("s{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+    prepare_as(client, name, query, types).await
+}
+
+/// Parses `query` as the unnamed statement, which the server replaces on the
+/// next parse and which is never closed.
+pub async fn describe(
+    client: &Arc<InnerClient>,
+    query: &str,
+    types: &[Type],
+) -> Result<Statement, Error> {
+    prepare_as(client, String::new(), query, types).await
+}
+
+async fn prepare_as(
+    client: &Arc<InnerClient>,
+    name: String,
+    query: &str,
+    types: &[Type],
+) -> Result<Statement, Error> {
     let buf = encode(client, &name, query, types)?;
     let mut responses = client.send(RequestMessages::Single(FrontendMessage::Raw(buf)))?;
 

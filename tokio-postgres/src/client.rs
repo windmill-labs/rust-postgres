@@ -285,6 +285,24 @@ impl Client {
         prepare::prepare(&self.inner, query, parameter_types).await
     }
 
+    /// Describes a query without leaving a prepared statement on the server.
+    ///
+    /// The query is parsed as the unnamed statement, and the types of its parameters and result
+    /// columns are resolved and cached on this client. The returned statement carries only that
+    /// description; run the query itself with [`Client::query_typed_raw`] or similar.
+    ///
+    /// Calling this first makes `query_typed` safe on results with types this client has not
+    /// seen yet (custom enums, domains, extension types). `query_typed` otherwise looks those up
+    /// while the server is already sending rows, and on a large enough result the lookup waits
+    /// behind rows nobody reads.
+    pub async fn describe_typed(
+        &self,
+        query: &str,
+        parameter_types: &[Type],
+    ) -> Result<Statement, Error> {
+        prepare::describe(&self.inner, query, parameter_types).await
+    }
+
     /// Executes a statement, returning a vector of the resulting rows.
     ///
     /// A statement may contain parameters, specified by `$n`, where `n` is the index of the parameter of the list
