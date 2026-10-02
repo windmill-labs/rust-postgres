@@ -1046,6 +1046,42 @@ async fn query_typed_large_result_with_unknown_type() {
         .unwrap();
 }
 
+// The rows of that query are read off the wire ahead of the consumer; a
+// disconnect while the session sits idle must not cut off rows already received.
+#[tokio::test]
+async fn query_typed_rows_survive_disconnect_after_arrival() {
+    let setup = connect("user=postgres").await;
+    setup
+        .batch_execute(
+            "DROP TYPE IF EXISTS query_typed_idle_mood;
+             CREATE TYPE query_typed_idle_mood AS ENUM ('ok');",
+        )
+        .await
+        .unwrap();
+
+    let (client, connection) = connect_raw("user=postgres").await.unwrap();
+    tokio::spawn(connection);
+    client
+        .batch_execute("SET idle_session_timeout = '1s'")
+        .await
+        .unwrap();
+    let rows = client
+        .query_typed_raw(
+            "SELECT 'ok'::query_typed_idle_mood, repeat('x', 300) FROM generate_series(1, 100000)",
+            Vec::<(i32, Type)>::new(),
+        )
+        .await
+        .unwrap();
+    time::sleep(Duration::from_secs(3)).await;
+    let rows = rows.try_collect::<Vec<_>>().await.unwrap();
+    assert_eq!(rows.len(), 100000);
+
+    setup
+        .batch_execute("DROP TYPE query_typed_idle_mood")
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn query_typed_with_transaction() {
     let mut client = connect("user=postgres").await;

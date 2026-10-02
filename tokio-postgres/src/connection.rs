@@ -66,6 +66,9 @@ pub struct Connection<S, T> {
     pending_request: Option<RequestMessages>,
     pending_responses: VecDeque<BackendMessage>,
     responses: VecDeque<Response>,
+    /// A failure read off the wire, held back until every frame received
+    /// before it has been delivered.
+    read_error: Option<Error>,
     state: State,
 }
 
@@ -87,6 +90,7 @@ where
             pending_request: None,
             pending_responses,
             responses: VecDeque::new(),
+            read_error: None,
             state: State::Active,
         }
     }
@@ -113,14 +117,29 @@ where
 
         loop {
             self.flush_parked(cx);
+            if let Some(error) = self.read_error.take() {
+                if self.responses.iter().all(|r| r.parked.is_empty()) {
+                    return Err(error);
+                }
+                self.read_error = Some(error);
+                trace!("poll_read: delivering parked frames before failing");
+                return Ok(None);
+            }
             if self.must_wait_on_consumer() {
                 trace!("poll_read: waiting on sender");
                 return Ok(None);
             }
 
-            let message = match self.poll_response(cx)? {
-                Poll::Ready(Some(message)) => message,
-                Poll::Ready(None) => return Err(Error::closed()),
+            let message = match self.poll_response(cx) {
+                Poll::Ready(Some(Ok(message))) => message,
+                Poll::Ready(Some(Err(error))) => {
+                    self.read_error = Some(error);
+                    continue;
+                }
+                Poll::Ready(None) => {
+                    self.read_error = Some(Error::closed());
+                    continue;
+                }
                 Poll::Pending => {
                     trace!("poll_read: waiting on response");
                     return Ok(None);
@@ -229,10 +248,14 @@ where
     /// `query_typed` does when it looks up an unknown column type while the
     /// rows are already streaming. Frames are parked instead while any later
     /// request is in flight, so its reply can be read and delivered.
+    ///
+    /// Once every request has fully arrived, only a notice or a disconnect can
+    /// follow, so the wire waits until parked frames are delivered rather than
+    /// risk ending the connection under rows the consumer has not read yet.
     fn must_wait_on_consumer(&self) -> bool {
         match self.responses.iter().position(|r| !r.wire_complete()) {
             Some(idx) => !self.responses[idx].parked.is_empty() && idx + 1 == self.responses.len(),
-            None => false,
+            None => self.responses.iter().any(|r| !r.parked.is_empty()),
         }
     }
 
